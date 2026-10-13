@@ -1,0 +1,87 @@
+From e51cfedba9798507d96963503a88370fe9ae278c Mon Sep 17 00:00:00 2001
+From: Christian Schaller <cschalle@redhat.com>
+Date: Tue, 13 Oct 2026 10:56:34 -0400
+Subject: [PATCH 1/3] media: i2c: imx471: Fix V4L2_SEL_TGT_CROP returning
+ -EINVAL
+
+imx471_get_selection() handles V4L2_SEL_TGT_CROP but ends the case with
+break rather than return 0, so it falls out of the switch into the
+trailing return -EINVAL and the target never succeeds. The driver also
+never stores a crop rectangle in the subdev state, so returning success
+on its own would hand userspace a zeroed rectangle.
+
+Describe the analogue crop in struct imx471_mode, store it in the subdev
+state when the format is set, and return success for the target.
+
+Without this libcamera cannot retrieve the crop rectangle and assumes
+readout covers the whole active pixel array:
+
+  imx471 0-001a: Unable to get rectangle 0 on pad 0/0: Invalid argument
+  imx471 0-001a: Failed to retrieve the sensor crop rectangle
+  imx471 0-001a: The analogue crop rectangle has been defaulted to the
+                 active area size
+
+The mode in fact reads out 3856x2176 of the 4656x3496 array, so both the
+lens shading geometry and the binning factor that userspace derives from
+the ratio between the crop rectangle and the output format were wrong.
+
+Fixes: be1589e567ae ("media: i2c: imx471: Add Sony IMX471 image sensor driver")
+Signed-off-by: Christian Schaller <cschalle@redhat.com>
+---
+ drivers/media/i2c/imx471.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/imx471.c b/drivers/media/i2c/imx471.c
+index 4053aed84..348dbd3de 100644
+--- a/drivers/media/i2c/imx471.c
++++ b/drivers/media/i2c/imx471.c
+@@ -131,6 +131,9 @@ struct imx471_mode {
+ 	/* H-timing */
+ 	u32 llp;
+ 
++	/* Analogue crop rectangle in the sensor's pixel array */
++	struct v4l2_rect crop;
++
+ 	const struct cci_reg_sequence *default_mode_regs;
+ 	unsigned int default_mode_regs_length;
+ };
+@@ -283,6 +286,19 @@ static const struct imx471_mode imx471_modes[] = {
+ 		.fll_def = 1308,
+ 		.fll_min = 1308,
+ 		.llp = 2328,
++		/*
++		 * The mode reads out rows 408..3051 and columns 8..4647 of the
++		 * pixel array, bins that 2x2 and then digitally crops 1928x1088
++		 * at (208,108) of the binned frame, so in pixel array
++		 * coordinates the analogue crop starts at
++		 * (8 + 208 * 2, 408 + 108 * 2) and spans 1928 * 2 x 1088 * 2.
++		 */
++		.crop = {
++			.left = 424,
++			.top = 624,
++			.width = 3856,
++			.height = 2176,
++		},
+ 		.default_mode_regs = mode_1928x1088_regs,
+ 		.default_mode_regs_length = ARRAY_SIZE(mode_1928x1088_regs),
+ 	},
+@@ -430,6 +446,7 @@ static int imx471_set_pad_format(struct v4l2_subdev *sd,
+ 	imx471_update_pad_format(sensor, mode, fmt);
+ 
+ 	*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
++	*v4l2_subdev_state_get_crop(sd_state, fmt->pad) = mode->crop;
+ 
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
+ 		return 0;
+@@ -461,7 +478,7 @@ static int imx471_get_selection(struct v4l2_subdev *sd,
+ 	switch (sel->target) {
+ 	case V4L2_SEL_TGT_CROP:
+ 		sel->r = *v4l2_subdev_state_get_crop(sd_state, sel->pad);
+-		break;
++		return 0;
+ 
+ 	case V4L2_SEL_TGT_NATIVE_SIZE:
+ 		sel->r.top = 0;
+-- 
+2.55.0
+

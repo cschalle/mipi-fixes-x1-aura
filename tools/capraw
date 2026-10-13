@@ -1,0 +1,22 @@
+#!/usr/bin/bash
+# capraw <name> [frames] - capture raw Bayer frames with fixed, repeatable params.
+set -euo pipefail
+NAME="${1:?usage: capraw <name> [frames]}"
+N="${2:-12}"
+OUT="/home/cschalle/projects/mipi-camera/captures/${NAME}.bin"
+DEV=/dev/video0
+SUB=/dev/v4l-subdev4
+
+# Record the control state alongside the pixels: without it a capture is
+# uninterpretable later (exposure/gain determine everything about the histogram).
+{
+  echo "# capraw $(date -Is)"
+  echo "# device: $DEV  subdev: $SUB  frames: $N"
+  v4l2-ctl -d "$DEV" --get-fmt-video
+  echo "# --- controls ---"
+  v4l2-ctl -d "$SUB" -L
+} > "${OUT%.bin}.meta" 2>&1
+
+timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$N" \
+    --stream-to="$OUT" >/dev/null 2>&1
+printf '%s (%s, %s frames)\n' "$OUT" "$(du -h "$OUT" | cut -f1)" "$N"

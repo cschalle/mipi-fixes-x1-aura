@@ -1,0 +1,54 @@
+From 5cf84f3eda244f0a30684c2b323a5489edd9cb1b Mon Sep 17 00:00:00 2001
+From: Christian Schaller <cschalle@redhat.com>
+Date: Tue, 13 Oct 2026 12:41:56 -0400
+Subject: [PATCH 0/3] media: i2c: imx471: selection, test pattern and gain fixes
+
+Three fixes for the IMX471 driver, found while investigating poor image
+quality from the front camera of a Lenovo ThinkPad X1 Carbon Gen 14,
+where the sensor feeds an Intel IPU7 and all processing is done by
+libcamera's software ISP.
+
+Patch 1 makes V4L2_SEL_TGT_CROP work. The target currently ends its case
+with break and so returns -EINVAL, and no crop rectangle is ever stored
+in the subdev state, so the rectangle has to be described and stored as
+well. libcamera reports this one itself ("The sensor kernel driver needs
+to be fixed") and silently assumes readout covers the full pixel array,
+which it does not.
+
+Patch 2 fixes TEST_PATTERN_MODE being declared CCI_REG8 when 0x0600 is a
+16 bit register, which left the test pattern generator inoperative.
+
+Patch 3 raises IMX471_ANA_GAIN_MAX from 800 to 960. The gain law is
+gain = 1024 / (1024 - code), so the current limit caps analogue gain at
+4.57x where the sensor reaches 16x, giving up 1.8 stops. On this machine
+the software ISP saturates exposure and analogue gain together and still
+underexposes an ordinary indoor scene by roughly 3.8 stops.
+
+All three were tested on the affected hardware, built into a Fedora
+kernel package:
+
+ - V4L2_SEL_TGT_CROP goes from failing with -EINVAL to returning
+   (424,624)/3856x2176, and libcamera's four complaints about the crop
+   rectangle disappear.
+ - The test pattern generator produces colour bars where it previously
+   produced nothing. The bar order also independently confirms the
+   SRGGB Bayer order the driver advertises.
+ - Analogue gain code 960 measures 16.07x against a predicted 16x, and
+   3.48x over the previous ceiling against 3.50x predicted.
+
+---
+These patches were prepared with assistance from Claude (Anthropic).
+All changes were reviewed and tested on the affected hardware.
+
+Christian Schaller (3):
+  media: i2c: imx471: Fix V4L2_SEL_TGT_CROP returning -EINVAL
+  media: i2c: imx471: Fix test pattern register width
+  media: i2c: imx471: Raise the analogue gain limit to the sensor
+    maximum
+
+ drivers/media/i2c/imx471.c | 23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+-- 
+2.55.0
+

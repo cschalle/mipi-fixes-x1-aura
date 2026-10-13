@@ -1,0 +1,1457 @@
+From e4204329f1dddb72deee76bfc51b0adf2cb61d11 Mon Sep 17 00:00:00 2001
+From: Christian Schaller <cschalle@redhat.com>
+Date: Tue, 13 Oct 2026 15:03:14 -0400
+Subject: [PATCH 1/2] software_isp: Add lens shading correction
+
+Backport of the lens shading support written against libcamera master, with a
+self-contained algorithm because this release predates libipa's shared
+LscAlgorithm. Includes the imx471 tuning data for the Lenovo ThinkPad X1
+Carbon Gen 14.
+---
+ .../internal/software_isp/debayer_params.h    |  24 ++
+ .../internal/software_isp/software_isp.h      |   1 +
+ include/libcamera/ipa/soft.mojom              |   3 +-
+ src/ipa/simple/algorithms/lsc.cpp             | 183 +++++++++++++++
+ src/ipa/simple/algorithms/lsc.h               |  51 +++++
+ src/ipa/simple/algorithms/meson.build         |   1 +
+ src/ipa/simple/data/imx471.yaml               | 215 ++++++++++++++++++
+ src/ipa/simple/data/meson.build               |   1 +
+ src/ipa/simple/ipa_context.h                  |   1 +
+ src/ipa/simple/soft_simple.cpp                |   5 +-
+ src/libcamera/shaders/bayer_unpacked.frag     |  17 ++
+ src/libcamera/software_isp/debayer.h          |   2 +-
+ src/libcamera/software_isp/debayer_cpu.cpp    | 209 ++++++++++++-----
+ src/libcamera/software_isp/debayer_cpu.h      |  89 +++++---
+ src/libcamera/software_isp/debayer_egl.cpp    |  84 ++++++-
+ src/libcamera/software_isp/debayer_egl.h      |   9 +-
+ src/libcamera/software_isp/software_isp.cpp   |   4 +-
+ 17 files changed, 811 insertions(+), 88 deletions(-)
+ create mode 100644 src/ipa/simple/algorithms/lsc.cpp
+ create mode 100644 src/ipa/simple/algorithms/lsc.h
+ create mode 100644 src/ipa/simple/data/imx471.yaml
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 6772b43..bbdb0a6 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -25,6 +25,30 @@ struct DebayerParams {
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++
++	/*
++	 * Lens shading correction gains, one coarse grid per Bayer channel,
++	 * bilinearly interpolated over the frame by the debayer backend.
++	 *
++	 * The grid is a fixed size array rather than a container because this
++	 * structure lives in memory shared with the IPA. 17x17 matches the grid
++	 * size the rkisp1 hardware uses for the same purpose, which is ample for
++	 * a correction this smooth.
++	 *
++	 * A width or height of zero disables the correction, which is the
++	 * default so that sensors without shading data are unaffected.
++	 */
++	static constexpr unsigned int kLscGridWidth = 17;
++	static constexpr unsigned int kLscGridHeight = 17;
++
++	struct {
++		unsigned int width = 0;
++		unsigned int height = 0;
++		float r[kLscGridHeight][kLscGridWidth] = {};
++		float gr[kLscGridHeight][kLscGridWidth] = {};
++		float gb[kLscGridHeight][kLscGridWidth] = {};
++		float b[kLscGridHeight][kLscGridWidth] = {};
++	} shading;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index 585e0d6..f9bda25 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -100,6 +100,7 @@ private:
+ 	DebayerParams debayerParams_;
+ 	DmaBufAllocator dmaHeap_;
+ 	bool ccmEnabled_;
++	bool lscEnabled_;
+ 
+ 	std::unique_ptr<ipa::soft::IPAProxySoft> ipa_;
+ 	std::deque<FrameBuffer *> queuedInputBuffers_;
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 77328c5..ab05db1 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -18,7 +18,8 @@ interface IPASoftInterface {
+ 	     libcamera.SharedFD fdParams,
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls)
+-		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
++		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled,
++		    bool lscEnabled);
+ 	start() => (int32 ret);
+ 	stop();
+ 	configure(IPAConfigInfo configInfo)
+diff --git a/src/ipa/simple/algorithms/lsc.cpp b/src/ipa/simple/algorithms/lsc.cpp
+new file mode 100644
+index 0000000..0e42931
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.cpp
+@@ -0,0 +1,183 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Software ISP lens shading correction
++ *
++ * Self contained rather than built on libipa's shared LscAlgorithm, which does
++ * not exist in this release. It parses radial polynomials directly and samples
++ * them over the sensor's analogue crop.
++ */
++
++#include "lsc.h"
++
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++namespace {
++
++const char *kComponents[] = { "r", "gr", "gb", "b" };
++
++std::optional<ipa::LscPolynomial> parsePolynomial(const ValueNode &node)
++{
++	const auto cx = node["cx"].get<double>();
++	const auto cy = node["cy"].get<double>();
++	const auto k0 = node["k0"].get<double>();
++	const auto k1 = node["k1"].get<double>();
++	const auto k2 = node["k2"].get<double>();
++	const auto k3 = node["k3"].get<double>();
++	const auto k4 = node["k4"].get<double>();
++
++	if (!cx || !cy || !k0 || !k1 || !k2 || !k3 || !k4)
++		return {};
++
++	return ipa::LscPolynomial(*cx, *cy, *k0, *k1, *k2, *k3, *k4);
++}
++
++} /* namespace */
++
++int LensShadingCorrection::init(IPAContext &context, const ValueNode &tuningData)
++{
++	const ValueNode &sets = tuningData["sets"];
++	if (!sets.isList()) {
++		LOG(IPASoftLsc, Error) << "'sets' not found in tuning data";
++		return -EINVAL;
++	}
++
++	for (const auto &set : sets.asList()) {
++		const auto ct = set["ct"].get<uint32_t>();
++		if (!ct) {
++			LOG(IPASoftLsc, Error) << "A shading set has no 'ct'";
++			return -EINVAL;
++		}
++
++		Components components;
++		for (const char *key : kComponents) {
++			auto poly = parsePolynomial(set[key]);
++			if (!poly) {
++				LOG(IPASoftLsc, Error)
++					<< "Shading set " << *ct
++					<< " is missing or has an incomplete '"
++					<< key << "' polynomial";
++				return -EINVAL;
++			}
++			components.emplace(key, *poly);
++		}
++
++		sets_[*ct] = std::move(components);
++	}
++
++	if (sets_.empty()) {
++		LOG(IPASoftLsc, Error) << "No shading sets were loaded";
++		return -EINVAL;
++	}
++
++	context.lscEnabled = true;
++	LOG(IPASoftLsc, Debug) << "Loaded " << sets_.size() << " shading sets";
++
++	return 0;
++}
++
++int LensShadingCorrection::configure(IPAContext &context,
++				     [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	sensorSize_ = context.sensorInfo.activeAreaSize;
++	crop_ = context.sensorInfo.analogCrop;
++	lastCt_ = 0;
++
++	/*
++	 * The polynomials are defined over the whole active pixel array, so
++	 * that is the reference the radius is normalised against.
++	 */
++	for (auto &[ct, components] : sets_)
++		for (auto &[key, poly] : components)
++			poly.setReferenceImageSize(sensorSize_);
++
++	LOG(IPASoftLsc, Debug)
++		<< "Shading over crop " << crop_ << " of active area " << sensorSize_;
++
++	return 0;
++}
++
++/*
++ * Evaluate one polynomial on the correction grid. Grid nodes span the analogue
++ * crop, which is the part of the pixel array the sensor actually reads out.
++ */
++void LensShadingCorrection::sampleInto(const ipa::LscPolynomial &poly,
++				       float dst[DebayerParams::kLscGridHeight]
++						[DebayerParams::kLscGridWidth]) const
++{
++	const double m = poly.getM();
++	const double x0 = crop_.x / m;
++	const double y0 = crop_.y / m;
++	const double w = crop_.width / m;
++	const double h = crop_.height / m;
++
++	for (unsigned int gy = 0; gy < DebayerParams::kLscGridHeight; gy++) {
++		const double y = static_cast<double>(gy) /
++				 (DebayerParams::kLscGridHeight - 1);
++
++		for (unsigned int gx = 0; gx < DebayerParams::kLscGridWidth; gx++) {
++			const double x = static_cast<double>(gx) /
++					 (DebayerParams::kLscGridWidth - 1);
++
++			dst[gy][gx] = static_cast<float>(
++				poly.sampleAtNormalizedPixelPos(x0 + x * w,
++								y0 + y * h));
++		}
++	}
++}
++
++void LensShadingCorrection::prepare(IPAContext &context,
++				    [[maybe_unused]] const uint32_t frame,
++				    [[maybe_unused]] IPAFrameContext &frameContext,
++				    DebayerParams *params)
++{
++	if (sets_.empty()) {
++		params->shading.width = 0;
++		params->shading.height = 0;
++		return;
++	}
++
++	const unsigned int ct = context.activeState.awb.temperatureK;
++
++	/*
++	 * Shading varies far more slowly than the colour temperature estimate
++	 * jitters, so only resample on a meaningful change.
++	 */
++	if (lastCt_ &&
++	    std::abs(static_cast<int>(ct) - static_cast<int>(lastCt_)) < 50)
++		return;
++
++	lastCt_ = ct;
++
++	/* Nearest set at or above ct, clamped to the ends of the range. */
++	auto it = sets_.lower_bound(ct);
++	if (it == sets_.end())
++		--it;
++
++	const Components &components = it->second;
++
++	sampleInto(components.find("r")->second, params->shading.r);
++	sampleInto(components.find("gr")->second, params->shading.gr);
++	sampleInto(components.find("gb")->second, params->shading.gb);
++	sampleInto(components.find("b")->second, params->shading.b);
++
++	params->shading.width = DebayerParams::kLscGridWidth;
++	params->shading.height = DebayerParams::kLscGridHeight;
++}
++
++REGISTER_IPA_ALGORITHM(LensShadingCorrection, "LensShadingCorrection")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/lsc.h b/src/ipa/simple/algorithms/lsc.h
+new file mode 100644
+index 0000000..8167bc4
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Software ISP lens shading correction
++ */
++
++#pragma once
++
++#include <map>
++#include <string>
++
++#include "libcamera/internal/value_node.h"
++
++#include "libipa/lsc_polynomial.h"
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class LensShadingCorrection : public Algorithm
++{
++public:
++	LensShadingCorrection() = default;
++	~LensShadingCorrection() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	/* One radial polynomial per Bayer component, for one illuminant. */
++	using Components = std::map<std::string, ipa::LscPolynomial, std::less<>>;
++
++	void sampleInto(const ipa::LscPolynomial &poly,
++			float dst[DebayerParams::kLscGridHeight]
++				 [DebayerParams::kLscGridWidth]) const;
++
++	std::map<unsigned int, Components> sets_;
++	Rectangle crop_;
++	Size sensorSize_;
++	unsigned int lastCt_ = 0;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index 73c6372..c9f6e55 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -6,4 +6,5 @@ soft_simple_ipa_algorithms = files([
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'lsc.cpp',
+ ])
+diff --git a/src/ipa/simple/data/imx471.yaml b/src/ipa/simple/data/imx471.yaml
+new file mode 100644
+index 0000000..1c996db
+--- /dev/null
++++ b/src/ipa/simple/data/imx471.yaml
+@@ -0,0 +1,215 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# Sony IMX471 as fitted to the Lenovo ThinkPad X1 Carbon Gen 14.
++#
++# Black level is the sensor pedestal of 64 DN at 10 bits, in the 16 bit
++# units the BlackLevel algorithm expects (64 << 6).
++#
++# Lens shading gains use 1024 for unity, as the rkisp1 tuning files do.
++# The grids cover the full active pixel array; libipa resamples them for
++# whatever the sensor reports as its analogue crop.
++#
++# Colour matrices are applied after white balance and each row sums to
++# one, so a neutral input stays neutral.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - LensShadingCorrection:
++      # Polynomial rather than tabular: LscTable cannot resample its
++      # grids for the sensor's analogue crop, and this sensor reads
++      # out 3856x2176 of its 4656x3496 array.
++      type: polynomial
++      sets:
++        - ct: 2694
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.232229
++            k1: 1.915956
++            k2: -14.198143
++            k3: 119.530090
++            k4: -142.976535
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.920948
++            k1: -19.683118
++            k2: 85.355875
++            k3: -81.816705
++            k4: -2.060203
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 7.077360
++            k1: -22.382449
++            k2: 98.141051
++            k3: -105.649614
++            k4: 13.571106
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 8.171521
++            k1: -38.310003
++            k2: 170.954282
++            k3: -245.436970
++            k4: 102.751629
++        - ct: 2784
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.226037
++            k1: 11.073734
++            k2: -74.125876
++            k3: 252.645405
++            k4: -233.984590
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.667568
++            k1: -0.577362
++            k2: -19.064756
++            k3: 140.945685
++            k4: -157.090270
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.671206
++            k1: -0.411480
++            k2: -21.170422
++            k3: 147.394508
++            k4: -162.495936
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.052429
++            k1: -3.462263
++            k2: -16.376015
++            k3: 152.234446
++            k4: -173.939470
++        - ct: 3615
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.010856
++            k1: 13.168908
++            k2: -88.904793
++            k3: 282.242117
++            k4: -251.237449
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.438938
++            k1: 2.429768
++            k2: -37.511897
++            k3: 180.480346
++            k4: -182.394238
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.348225
++            k1: 4.108769
++            k2: -46.949139
++            k3: 201.032522
++            k4: -197.290819
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.785844
++            k1: -0.926603
++            k2: -31.545241
++            k3: 184.581931
++            k4: -194.789394
++        - ct: 4656
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.715300
++            k1: 5.886968
++            k2: -41.597981
++            k3: 185.498864
++            k4: -191.226206
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.470832
++            k1: -15.162845
++            k2: 56.971950
++            k3: -14.009118
++            k4: -52.529325
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.451844
++            k1: -15.003759
++            k2: 55.636071
++            k3: -10.165509
++            k4: -55.719439
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 7.116974
++            k1: -25.946604
++            k2: 102.546829
++            k3: -92.791874
++            k4: -6.017692
++        - ct: 5694
++          r:
++            cx: 0.5
++            cy: 0.5
++            k0: 5.576617
++            k1: 7.416494
++            k2: -51.072650
++            k3: 205.590949
++            k4: -204.634659
++          gr:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.291010
++            k1: -12.237752
++            k2: 39.313214
++            k3: 24.817206
++            k4: -79.980926
++          gb:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.361141
++            k1: -13.343367
++            k2: 44.397609
++            k3: 15.754901
++            k4: -74.312527
++          b:
++            cx: 0.5
++            cy: 0.5
++            k0: 6.748991
++            k1: -19.059683
++            k2: 65.432697
++            k3: -15.595871
++            k4: -59.388143
++  - Awb:
++  - Ccm:
++      ccms:
++        - ct: 2694
++          ccm: [  1.5632, -0.3171, -0.2461,
++                 -0.4703,  1.6967, -0.2264,
++                  0.0009, -0.9716,  1.9707 ]
++        - ct: 2784
++          ccm: [  1.6169, -0.4751, -0.1418,
++                 -0.4882,  1.6958, -0.2075,
++                  0.0066, -0.7474,  1.7407 ]
++        - ct: 3615
++          ccm: [  1.6768, -0.5785, -0.0983,
++                 -0.3825,  1.5926, -0.2101,
++                 -0.0014, -0.6058,  1.6072 ]
++        - ct: 4656
++          ccm: [  1.5392, -0.3893, -0.1500,
++                 -0.2889,  1.5346, -0.2457,
++                  0.0005, -0.5633,  1.5628 ]
++        - ct: 5694
++          ccm: [  1.5414, -0.4120, -0.1293,
++                 -0.2660,  1.6099, -0.3438,
++                 -0.0014, -0.5417,  1.5431 ]
++  - Adjust:
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
+index 92795ee..531f73a 100644
+--- a/src/ipa/simple/data/meson.build
++++ b/src/ipa/simple/data/meson.build
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'imx471.yaml',
+     'uncalibrated.yaml',
+ ])
+ 
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 34f7403..53b2b58 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -93,6 +93,7 @@ struct IPAContext {
+ 	FCQueue<IPAFrameContext> frameContexts;
+ 	ControlInfoMap::Map ctrlMap;
+ 	bool ccmEnabled = false;
++	bool lscEnabled = false;
+ };
+ 
+ } /* namespace ipa::soft */
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a3..402241f 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -57,7 +57,7 @@ public:
+ 		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
+ 		 ControlInfoMap *ipaControls,
+-		 bool *ccmEnabled) override;
++		 bool *ccmEnabled, bool *lscEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+ 
+ 	int start() override;
+@@ -97,7 +97,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
+ 			ControlInfoMap *ipaControls,
+-			bool *ccmEnabled)
++			bool *ccmEnabled, bool *lscEnabled)
+ {
+ 	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
+ 	if (!camHelper_) {
+@@ -136,6 +136,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 		return ret;
+ 
+ 	*ccmEnabled = context_.ccmEnabled;
++	*lscEnabled = context_.lscEnabled;
+ 
+ 	params_ = nullptr;
+ 	stats_ = nullptr;
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 1b85196..7223ef7 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -28,6 +28,15 @@ uniform mat3            ccm;
+ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
++#if defined(LSC_ENABLED)
++/*
++ * Lens shading gains on a small grid covering the sensor's analogue crop,
++ * stored as 8 bit (gain - 1) / lscScale so no float texture extension is
++ * needed. GL_LINEAR interpolates between grid nodes for free.
++ */
++uniform sampler2D       lsc;
++uniform float           lscScale;
++#endif
+ 
+ float apply_contrast(float value)
+ {
+@@ -130,6 +139,14 @@ void main(void) {
+ 
+     rgb = rgb - blacklevel;
+ 
++#if defined(LSC_ENABLED)
++    /*
++     * Lens shading is a gain on the signal above black level, so it belongs
++     * here: after black level removal and before white balance.
++     */
++    rgb *= 1.0 + texture2D(lsc, center.xy).rgb * lscScale;
++#endif
++
+     /*
+      *   CCM is a 3x3 in the format
+      *
+diff --git a/src/libcamera/software_isp/debayer.h b/src/libcamera/software_isp/debayer.h
+index a2a17ec..9c4e992 100644
+--- a/src/libcamera/software_isp/debayer.h
++++ b/src/libcamera/software_isp/debayer.h
+@@ -40,7 +40,7 @@ public:
+ 
+ 	virtual int configure(const StreamConfiguration &inputCfg,
+ 			      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			      bool ccmEnabled) = 0;
++			      bool ccmEnabled, bool lscEnabled) = 0;
+ 
+ 	virtual std::vector<PixelFormat> formats(PixelFormat inputFormat) = 0;
+ 
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index d9f5b32..5e9e95c 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -62,6 +62,28 @@ private:
+ 	unsigned int lineBufferIndex_;
+ 	std::vector<uint8_t> lineBuffers_[kMaxLineBuffers];
+ 	bool enableInputMemcpy_;
++
++	/* Per-thread shading gain rows, see DebayerCpu::LscRow. */
++	std::vector<float> lscB_;
++	std::vector<float> lscG_;
++	std::vector<float> lscR_;
++
++	DebayerCpu::LscRow lscRowFor(unsigned int y)
++	{
++		if (!debayer_->lscEnabled_)
++			return { nullptr, nullptr, nullptr };
++
++		const unsigned int width = debayer_->window_.width;
++		if (lscB_.size() < width) {
++			lscB_.resize(width, 1.0f);
++			lscG_.resize(width, 1.0f);
++			lscR_.resize(width, 1.0f);
++		}
++
++		debayer_->computeLscRow(y, lscB_.data(), lscG_.data(), lscR_.data());
++
++		return { lscB_.data(), lscG_.data(), lscR_.data() };
++	}
+ };
+ 
+ /**
+@@ -130,21 +152,29 @@ DebayerCpu::~DebayerCpu() = default;
+ #define GAMMA(value) \
+ 	*dst++ = gammaLut_[std::clamp(value, 0, static_cast<int>(gammaLut_.size()) - 1)]
+ 
+-#define STORE_PIXEL(b_, g_, r_)                         \
+-	if constexpr (ccmEnabled) {                     \
+-		const CcmColumn &blue = blueCcm_[b_];   \
+-		const CcmColumn &green = greenCcm_[g_]; \
+-		const CcmColumn &red = redCcm_[r_];     \
+-		GAMMA(blue.b + green.b + red.b);        \
+-		GAMMA(blue.g + green.g + red.g);        \
+-		GAMMA(blue.r + green.r + red.r);        \
+-	} else {                                        \
+-		*dst++ = blue_[b_];                     \
+-		*dst++ = green_[g_];                    \
+-		*dst++ = red_[r_];                      \
+-	}                                               \
+-	if constexpr (addAlphaByte)                     \
+-		*dst++ = 255;                           \
++#define LSC_INDEX(v_, c_, k_) \
++	(lscEnabled ? lscApply((v_), lsc.c_[x], lscBlack_[k_]) : (v_))
++
++#define STORE_PIXEL(b_, g_, r_)                                 \
++	{                                                       \
++		const int bIdx = LSC_INDEX(b_, b, 0);           \
++		const int gIdx = LSC_INDEX(g_, g, 1);           \
++		const int rIdx = LSC_INDEX(r_, r, 2);           \
++		if constexpr (ccmEnabled) {                     \
++			const CcmColumn &blue = blueCcm_[bIdx];  \
++			const CcmColumn &green = greenCcm_[gIdx];\
++			const CcmColumn &red = redCcm_[rIdx];    \
++			GAMMA(blue.b + green.b + red.b);        \
++			GAMMA(blue.g + green.g + red.g);        \
++			GAMMA(blue.r + green.r + red.r);        \
++		} else {                                        \
++			*dst++ = blue_[bIdx];                   \
++			*dst++ = green_[gIdx];                  \
++			*dst++ = red_[rIdx];                    \
++		}                                               \
++	}                                                       \
++	if constexpr (addAlphaByte)                             \
++		*dst++ = 255;                                   \
+ 	x++;
+ 
+ /*
+@@ -191,8 +221,8 @@ DebayerCpu::~DebayerCpu() = default;
+ 		(prev[x] + curr[x - p] + curr[x + n] + next[x]) / (4 * (div)),         \
+ 		curr[x] / (div))
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint8_t)
+ 
+@@ -202,8 +232,8 @@ void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint8_t)
+ 
+@@ -213,8 +243,8 @@ void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -225,8 +255,8 @@ void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -237,8 +267,8 @@ void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -249,8 +279,8 @@ void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	DECLARE_SRC_POINTERS(uint16_t)
+ 
+@@ -261,8 +291,8 @@ void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -287,8 +317,8 @@ void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -308,8 +338,8 @@ void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -329,8 +359,8 @@ void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[])
+ 	}
+ }
+ 
+-template<bool addAlphaByte, bool ccmEnabled>
+-void DebayerCpu::debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[])
++template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++void DebayerCpu::debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
+ {
+ 	const int widthInBytes = window_.width * 5 / 4;
+ 	const uint8_t *prev = src[0];
+@@ -439,17 +469,24 @@ int DebayerCpu::setupStandardBayerOrder(BayerFormat::Order order)
+ 	return 0;
+ }
+ 
+-#define SET_DEBAYER_METHODS(method0, method1)                                                                        \
+-	debayer0_ = addAlphaByte                                                                                     \
+-			    ? (ccmEnabled ? &DebayerCpu::method0<true, true> : &DebayerCpu::method0<true, false>)    \
+-			    : (ccmEnabled ? &DebayerCpu::method0<false, true> : &DebayerCpu::method0<false, false>); \
+-	debayer1_ = addAlphaByte                                                                                     \
+-			    ? (ccmEnabled ? &DebayerCpu::method1<true, true> : &DebayerCpu::method1<true, false>)    \
+-			    : (ccmEnabled ? &DebayerCpu::method1<false, true> : &DebayerCpu::method1<false, false>);
++#define SELECT_DEBAYER_METHOD(method, alpha)                            \
++	(ccmEnabled                                                     \
++		 ? (lscEnabled ? &DebayerCpu::method<alpha, true, true>  \
++			       : &DebayerCpu::method<alpha, true, false>) \
++		 : (lscEnabled ? &DebayerCpu::method<alpha, false, true> \
++			       : &DebayerCpu::method<alpha, false, false>))
++
++#define SET_DEBAYER_METHODS(method0, method1)                       \
++	debayer0_ = addAlphaByte                                    \
++			    ? SELECT_DEBAYER_METHOD(method0, true)  \
++			    : SELECT_DEBAYER_METHOD(method0, false); \
++	debayer1_ = addAlphaByte                                    \
++			    ? SELECT_DEBAYER_METHOD(method1, true)  \
++			    : SELECT_DEBAYER_METHOD(method1, false);
+ 
+ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat,
+ 				    PixelFormat outputFormat,
+-				    bool ccmEnabled)
++				    bool ccmEnabled, bool lscEnabled)
+ {
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputFormat);
+@@ -542,7 +579,7 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat,
+ 
+ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			  bool ccmEnabled)
++			  bool ccmEnabled, bool lscEnabled)
+ {
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+@@ -583,11 +620,12 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 
+ 	int ret = setDebayerFunctions(inputCfg.pixelFormat,
+ 				      outputCfg.pixelFormat,
+-				      ccmEnabled);
++				      ccmEnabled, lscEnabled);
+ 	if (ret != 0)
+ 		return -EINVAL;
+ 
+ 	ccmEnabled_ = ccmEnabled;
++	lscEnabled_ = lscEnabled;
+ 
+ 	/*
+ 	 * Lookup tables must be initialized because the initial value is used for
+@@ -797,13 +835,13 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
+-		debayer_->debayer0(dst, linePointers);
++		debayer_->debayer0(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+-		debayer_->debayer1(dst, linePointers);
++		debayer_->debayer1(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 	}
+@@ -812,14 +850,14 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine0(frame, yEnd, linePointers, threadIndex_);
+-		debayer_->debayer0(dst, linePointers);
++		debayer_->debayer0(dst, linePointers, lscRowFor(yEnd));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		/* next line may point outside of src, use prev. */
+ 		linePointers[2] = linePointers[0];
+-		debayer_->debayer1(dst, linePointers);
++		debayer_->debayer1(dst, linePointers, lscRowFor(yEnd + 1));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 	}
+@@ -853,31 +891,87 @@ void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
+-		debayer_->debayer0(dst, linePointers);
++		debayer_->debayer0(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+-		debayer_->debayer1(dst, linePointers);
++		debayer_->debayer1(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+ 		debayer_->stats_->processLine2(frame, y, linePointers, threadIndex_);
+-		debayer_->debayer2(dst, linePointers);
++		debayer_->debayer2(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+ 		memcpyNextLine(linePointers);
+-		debayer_->debayer3(dst, linePointers);
++		debayer_->debayer3(dst, linePointers, lscRowFor(y));
+ 		src += inputStride;
+ 		dst += outputStride;
+ 	}
+ }
+ 
++int DebayerCpu::lscApply(int value, float gain, float black)
++{
++	const float corrected = black + (value - black) * gain;
++
++	return std::clamp(static_cast<int>(corrected + 0.5f), 0,
++			  static_cast<int>(kRGBLookupSize) - 1);
++}
++
++/*
++ * Resample the coarse shading grids onto one output line. Doing this per line
++ * rather than per pixel keeps the inner loop to a single multiply-add, and the
++ * correction is far too smooth for the interpolation error to be visible.
++ */
++void DebayerCpu::computeLscRow(unsigned int y, float *b, float *g, float *r) const
++{
++	const auto &shading = params_.shading;
++	const unsigned int gw = shading.width;
++	const unsigned int gh = shading.height;
++	const unsigned int width = window_.width;
++
++	if (!gw || !gh)
++		return;
++
++	const float fy = window_.height > 1
++			       ? static_cast<float>(y) * (gh - 1) / (window_.height - 1)
++			       : 0.0f;
++	const unsigned int y0 = std::min<unsigned int>(fy, gh - 1);
++	const unsigned int y1 = std::min<unsigned int>(y0 + 1, gh - 1);
++	const float wy = fy - y0;
++
++	for (unsigned int x = 0; x < width; x++) {
++		const float fx = width > 1
++				       ? static_cast<float>(x) * (gw - 1) / (width - 1)
++				       : 0.0f;
++		const unsigned int x0 = std::min<unsigned int>(fx, gw - 1);
++		const unsigned int x1 = std::min<unsigned int>(x0 + 1, gw - 1);
++		const float wx = fx - x0;
++
++		auto sample = [&](const float grid[DebayerParams::kLscGridHeight]
++					       [DebayerParams::kLscGridWidth]) {
++			const float top = grid[y0][x0] * (1.0f - wx) + grid[y0][x1] * wx;
++			const float bot = grid[y1][x0] * (1.0f - wx) + grid[y1][x1] * wx;
++			return top * (1.0f - wy) + bot * wy;
++		};
++
++		b[x] = sample(shading.b);
++		/*
++		 * The two green planes are averaged: the debayered green value
++		 * already mixes both Bayer greens, and they differ far less than
++		 * the interpolation error.
++		 */
++		g[x] = (sample(shading.gr) + sample(shading.gb)) / 2.0f;
++		r[x] = sample(shading.r);
++	}
++}
++
+ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ {
+ 	const RGB<float> blackLevel = params.blackLevel;
+@@ -922,6 +1016,15 @@ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ 	};
+ 	const unsigned int gammaTableSize = gammaTable_.size();
+ 	const double div = static_cast<double>(kRGBLookupSize) / gammaTableSize;
++
++	/*
++	 * Black level in lookup-table index units, ordered blue, green, red to
++	 * match the arguments of STORE_PIXEL. Shading is a gain on the signal
++	 * above black, so the index transform has to pivot about this.
++	 */
++	lscBlack_[0] = params.blackLevel[2] * kRGBLookupSize;
++	lscBlack_[1] = params.blackLevel[1] * kRGBLookupSize;
++	lscBlack_[2] = params.blackLevel[0] * kRGBLookupSize;
+ 	if (ccmEnabled_) {
+ 		if (gammaUpdateNeeded ||
+ 		    matrixChanged(params.combinedMatrix, params_.combinedMatrix)) {
+diff --git a/src/libcamera/software_isp/debayer_cpu.h b/src/libcamera/software_isp/debayer_cpu.h
+index 8c58775..861762a 100644
+--- a/src/libcamera/software_isp/debayer_cpu.h
++++ b/src/libcamera/software_isp/debayer_cpu.h
+@@ -36,7 +36,7 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      bool ccmEnabled) override;
++		      bool ccmEnabled, bool lscEnabled) override;
+ 	Size patternSize(PixelFormat inputFormat) override;
+ 	std::vector<PixelFormat> formats(PixelFormat input) override;
+ 	std::tuple<unsigned int, unsigned int>
+@@ -78,45 +78,77 @@ private:
+ 	 * pointers are passed holding: src[0] = 2-lines-up, src[1] = 1-line-up
+ 	 * src[2] = current-line, src[3] = 1-line-down, src[4] = 2-lines-down.
+ 	 */
+-	using debayerFn = void (DebayerCpu::*)(uint8_t *dst, const uint8_t *src[]);
++	/*
++	 * Per-column lens shading gains for the line being debayered, in the
++	 * same blue/green/red order the STORE_PIXEL macro uses. The rows are
++	 * owned by the calling thread, so threads do not share them.
++	 */
++	struct LscRow {
++		const float *b;
++		const float *g;
++		const float *r;
++	};
+ 
+-	void debayer0(uint8_t *dst, const uint8_t *src[]) { (this->*debayer0_)(dst, src); }
+-	void debayer1(uint8_t *dst, const uint8_t *src[]) { (this->*debayer1_)(dst, src); }
+-	void debayer2(uint8_t *dst, const uint8_t *src[]) { (this->*debayer2_)(dst, src); }
+-	void debayer3(uint8_t *dst, const uint8_t *src[]) { (this->*debayer3_)(dst, src); }
++	/*
++	 * Shading is a gain on the signal above black level, so it must be
++	 * applied before the lookup tables fold in gamma. Transforming the
++	 * table index is equivalent and costs one multiply-add per channel.
++	 */
++	static int lscApply(int value, float gain, float black);
++
++	using debayerFn = void (DebayerCpu::*)(uint8_t *dst, const uint8_t *src[],
++					       const LscRow &lsc);
++
++	void debayer0(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer0_)(dst, src, lsc);
++	}
++	void debayer1(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer1_)(dst, src, lsc);
++	}
++	void debayer2(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer2_)(dst, src, lsc);
++	}
++	void debayer3(uint8_t *dst, const uint8_t *src[], const LscRow &lsc)
++	{
++		(this->*debayer3_)(dst, src, lsc);
++	}
+ 
+ 	/* 8-bit raw bayer format */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* unpacked 10-bit raw bayer format */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* unpacked 12-bit raw bayer format */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 	/* CSI-2 packed 10-bit raw bayer format (all the 4 orders) */
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[]);
+-	template<bool addAlphaByte, bool ccmEnabled>
+-	void debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[]);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
++	template<bool addAlphaByte, bool ccmEnabled, bool lscEnabled>
++	void debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[], const LscRow &lsc);
+ 
+ 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
+ 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+ 	int setDebayerFunctions(PixelFormat inputFormat,
+ 				PixelFormat outputFormat,
+-				bool ccmEnabled);
++				bool ccmEnabled, bool lscEnabled);
+ 	void updateGammaTable(const DebayerParams &params);
++	void computeLscRow(unsigned int y, float *b, float *g, float *r) const;
+ 	void updateLookupTables(const DebayerParams &params);
+ 
+ 	static constexpr unsigned int kRGBLookupSize = 256;
+@@ -137,6 +169,9 @@ private:
+ 	std::array<double, kGammaLookupSize> gammaTable_;
+ 	LookupTable gammaLut_;
+ 	bool ccmEnabled_;
++	bool lscEnabled_ = false;
++	/* Black level in lookup-table index units, blue/green/red. */
++	float lscBlack_[3] = { 0.0f, 0.0f, 0.0f };
+ 	DebayerParams params_;
+ 
+ 	debayerFn debayer0_;
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 8f0c229..f424fc2 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -93,6 +93,78 @@ int DebayerEGL::getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &c
+ 	return -EINVAL;
+ }
+ 
++
++/*
++ * Upload the lens shading grid as an 8 bit RGB texture.
++ *
++ * Gains are stored as (gain - 1) / scale so that no float texture extension is
++ * required, with scale sent alongside so the shader can undo it. Quantising
++ * against the actual range rather than a fixed maximum keeps the step small:
++ * for a 6.35x corner gain it is about 0.02, well under the error already
++ * present in the polynomial fit the grid came from.
++ */
++void DebayerEGL::uploadLscTexture(const DebayerParams &params)
++{
++	const unsigned int gw = params.shading.width;
++	const unsigned int gh = params.shading.height;
++
++	if (!gw || !gh)
++		return;
++
++	float maxGain = 1.0f;
++	for (unsigned int y = 0; y < gh; y++) {
++		for (unsigned int x = 0; x < gw; x++) {
++			maxGain = std::max({ maxGain, params.shading.r[y][x],
++					     params.shading.gr[y][x],
++					     params.shading.gb[y][x],
++					     params.shading.b[y][x] });
++		}
++	}
++
++	const float scale = std::max(maxGain - 1.0f, 1e-3f);
++
++	std::vector<uint8_t> texels(gw * gh * 3);
++	for (unsigned int y = 0; y < gh; y++) {
++		for (unsigned int x = 0; x < gw; x++) {
++			/*
++			 * The two green planes are averaged: the demosaiced
++			 * green already mixes both Bayer greens.
++			 */
++			const float g = (params.shading.gr[y][x] +
++					 params.shading.gb[y][x]) / 2.0f;
++			const float c[3] = { params.shading.r[y][x], g,
++					     params.shading.b[y][x] };
++
++			for (unsigned int i = 0; i < 3; i++) {
++				const float n = (c[i] - 1.0f) / scale * 255.0f;
++				texels[(y * gw + x) * 3 + i] =
++					static_cast<uint8_t>(std::clamp(n, 0.0f, 255.0f));
++			}
++		}
++	}
++
++	if (!lscTexture_) {
++		glGenTextures(1, &lscTexture_);
++		glActiveTexture(GL_TEXTURE7);
++		glBindTexture(GL_TEXTURE_2D, lscTexture_);
++		/* GL_LINEAR gives the bilinear interpolation between nodes. */
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	} else {
++		glActiveTexture(GL_TEXTURE7);
++		glBindTexture(GL_TEXTURE_2D, lscTexture_);
++	}
++
++	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, gw, gh, 0, GL_RGB,
++		     GL_UNSIGNED_BYTE, texels.data());
++
++	glUniform1i(lscUniformDataIn_, 7);
++	glUniform1f(lscScaleUniformDataIn_, scale);
++}
++
+ int DebayerEGL::getShaderVariableLocations(void)
+ {
+ 	attributeVertex_ = glGetAttribLocation(programId_, "vertexIn");
+@@ -103,6 +175,8 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	lscUniformDataIn_ = glGetUniformLocation(programId_, "lsc");
++	lscScaleUniformDataIn_ = glGetUniformLocation(programId_, "lscScale");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -156,6 +230,9 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 		return -EINVAL;
+ 	}
+ 
++	if (lscEnabled_)
++		egl_.pushEnv(shaderEnv, "#define LSC_ENABLED");
++
+ 	/* Pixel location parameters */
+ 	glFormat_ = GL_LUMINANCE;
+ 	bytesPerPixel_ = 1;
+@@ -277,8 +354,10 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 
+ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			  [[maybe_unused]] bool ccmEnabled)
++			  [[maybe_unused]] bool ccmEnabled, bool lscEnabled)
+ {
++	lscEnabled_ = lscEnabled;
++
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+ 
+@@ -492,6 +571,9 @@ void DebayerEGL::setShaderVariableValues(const DebayerParams &params)
+ 	glUniform1f(contrastExpUniformDataIn_, params.contrastExp);
+ 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+ 
++	if (lscEnabled_)
++		uploadLscTexture(params);
++
+ 	return;
+ }
+ 
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index fcd281f..e6fb83f 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -45,7 +45,7 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      bool ccmEnabled) override;
++		      bool ccmEnabled, bool lscEnabled) override;
+ 
+ 	Size patternSize(PixelFormat inputFormat) override;
+ 
+@@ -101,6 +101,13 @@ private:
+ 
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
++	GLint lscUniformDataIn_;
++	GLint lscScaleUniformDataIn_;
++
++	/* Lens shading gain grid, uploaded as a small 8 bit texture. */
++	bool lscEnabled_ = false;
++	GLuint lscTexture_ = 0;
++	void uploadLscTexture(const DebayerParams &params);
+ 
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index d227bd8..8562998 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -155,7 +155,7 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 			 sensorInfo,
+ 			 sensor->controls(),
+ 			 ipaControls,
+-			 &ccmEnabled_);
++			 &ccmEnabled_, &lscEnabled_);
+ 	if (ret) {
+ 		LOG(SoftwareIsp, Error) << "IPA init failed";
+ 		debayer_.reset();
+@@ -271,7 +271,7 @@ int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_);
++	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_, lscEnabled_);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-- 
+2.55.0
+
+
+From 3ef56d434f13c7a2622daed0d0d981d019e692ea Mon Sep 17 00:00:00 2001
+From: Christian Schaller <cschalle@redhat.com>
+Date: Tue, 13 Oct 2026 19:24:03 -0400
+Subject: [PATCH 2/2] software_isp: Normalise statistics sums to 8 bits
+
+The per-channel sums gathered for AWB are accumulated in the sensor's native
+bit depth, but the black level the IPA subtracts from them is 8 bit. For a 10
+bit sensor black is therefore under-subtracted by a factor of four, which pulls
+every white balance gain towards unity and leaves a strong colour cast.
+
+On an IMX471 the measured gains were 1.035/1.070 where grey world requires
+1.316/1.806; after this change they are 1.283/1.760. Red/green at the output
+goes from 0.871 to 1.001 against a USB webcam reference of 0.99.
+---
+ src/libcamera/software_isp/swstats_cpu.cpp | 25 ++++++++++++++--------
+ subprojects/.wraplock                      |  0
+ 2 files changed, 16 insertions(+), 9 deletions(-)
+ create mode 100644 subprojects/.wraplock
+
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 5366e01..0e1501c 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -189,10 +189,17 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	yVal += b * kBlueYMul;             \
+ 	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+-#define SWSTATS_FINISH_LINE_STATS() \
+-	stats.sum_.r() += sumR;     \
+-	stats.sum_.g() += sumG;     \
+-	stats.sum_.b() += sumB;
++/*
++ * Normalise the channel sums to 8 bits, the same scale the IPA's black level is
++ * expressed in. Without this the sums for a 10 or 12 bit format stay in the
++ * sensor's native depth while the black level subtracted from them is 8 bit, so
++ * black is under-subtracted and every white balance gain is pulled towards
++ * unity.
++ */
++#define SWSTATS_FINISH_LINE_STATS(div)  \
++	stats.sum_.r() += sumR / (div); \
++	stats.sum_.g() += sumG / (div); \
++	stats.sum_.b() += sumB / (div);
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ {
+@@ -216,7 +223,7 @@ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+@@ -242,7 +249,7 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 		SWSTATS_ACCUMULATE_LINE_STATS(4)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(4)
+ }
+ 
+ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+@@ -268,7 +275,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 		SWSTATS_ACCUMULATE_LINE_STATS(16)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(16)
+ }
+ 
+ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+@@ -294,7 +301,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+@@ -320,7 +327,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ /**
+diff --git a/subprojects/.wraplock b/subprojects/.wraplock
+new file mode 100644
+index 0000000..e69de29
+-- 
+2.55.0
+

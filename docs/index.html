@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIPI Camera Fixes</title>
+<meta name="description" content="Kernel and libcamera fixes for the IMX471 camera on the ThinkPad X1 Carbon Gen 14.">
+<style>
+  :root {
+    --bg:#fbfaf8; --panel:#fff; --ink:#1b1a18; --muted:#5f5b55;
+    --line:#e4e0d9; --accent:#9a4a1e; --good:#2f6b3c; --code:#f2efea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#17161a; --panel:#1f1e23; --ink:#eceaf0; --muted:#a29eaa;
+      --line:#34323a; --accent:#e08a56; --good:#79c08a; --code:#26252b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#17161a; --panel:#1f1e23; --ink:#eceaf0; --muted:#a29eaa;
+    --line:#34323a; --accent:#e08a56; --good:#79c08a; --code:#26252b;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:960px; margin:0 auto; padding:0 16px; }
+  header { padding:64px 0 40px; border-bottom:1px solid var(--line); }
+  h1 { font-size:clamp(28px,5vw,44px); line-height:1.15; margin:0 0 12px; letter-spacing:-.02em; }
+  .sub { color:var(--muted); font-size:clamp(16px,2.2vw,19px); max-width:62ch; margin:0; }
+  .tag { display:inline-block; font-size:13px; letter-spacing:.08em; text-transform:uppercase;
+         color:var(--accent); font-weight:600; margin-bottom:14px; }
+  h2 { font-size:clamp(21px,3vw,28px); margin:56px 0 14px; letter-spacing:-.01em; }
+  h3 { font-size:17px; margin:28px 0 8px; }
+  p { margin:0 0 14px; max-width:68ch; }
+  a { color:var(--accent); }
+  .lede { font-size:17px; }
+  figure { margin:22px 0; }
+  figcaption { color:var(--muted); font-size:14px; margin-top:8px; }
+  img { width:100%; height:auto; display:block; border-radius:8px; border:1px solid var(--line); }
+  .pair { display:grid; gap:14px; grid-template-columns:1fr; }
+  @media (min-width:680px) { .pair { grid-template-columns:1fr 1fr; } }
+  .pair .lbl { font-size:13px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+               color:var(--muted); margin-bottom:6px; }
+  .pair .lbl.after { color:var(--good); }
+  table { border-collapse:collapse; width:100%; margin:16px 0 8px; font-size:15px; display:block; overflow-x:auto; }
+  th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+  td.num { font-variant-numeric:tabular-nums; }
+  .win { color:var(--good); font-weight:600; }
+  code { background:var(--code); padding:1px 5px; border-radius:4px; font-size:.9em;
+         font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { background:var(--code); padding:14px 16px; border-radius:8px; overflow-x:auto;
+        font-size:13.5px; line-height:1.5; border:1px solid var(--line); }
+  pre code { background:none; padding:0; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:18px 20px; margin:20px 0; }
+  .card h3 { margin-top:0; }
+  ul { max-width:68ch; padding-left:20px; }
+  li { margin-bottom:7px; }
+  footer { margin:72px 0 48px; padding-top:24px; border-top:1px solid var(--line);
+           color:var(--muted); font-size:14px; }
+  .btn { display:inline-block; background:var(--accent); color:#fff; text-decoration:none;
+         padding:9px 16px; border-radius:7px; font-weight:600; font-size:15px; margin:4px 8px 4px 0; }
+  .btn.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="tag">ThinkPad X1 Carbon Gen 14 &middot; Aura Edition</div>
+  <h1>Fixing the MIPI camera</h1>
+  <p class="sub">Five defects across the kernel sensor driver and libcamera's software ISP
+  left this camera dark, heavily vignetted and tinted yellow-green. Here is what was wrong,
+  how it was measured, and what changed.</p>
+  <p style="margin-top:22px">
+    <a class="btn" href="https://github.com/cschalle/mipi-fixes-x1-aura">Repository</a>
+    <a class="btn ghost" href="https://github.com/cschalle/mipi-fixes-x1-aura/releases">Prebuilt RPMs</a>
+  </p>
+</header>
+
+<h2>Before and after</h2>
+<p class="lede">The same camera in a Google Meet call, before the fixes and after. The
+yellow-green cast, the dark corners and the muddy skin tones are all gone.</p>
+
+<div class="pair">
+  <figure>
+    <div class="lbl">Before &mdash; stock Fedora 44</div>
+    <img src="images/meet-before.jpg" alt="Video call before the fixes, with a strong yellow-green cast">
+  </figure>
+  <figure>
+    <div class="lbl after">After &mdash; all five fixes</div>
+    <img src="images/final-after.jpg" alt="Camera output after the fixes, neutral colour">
+  </figure>
+</div>
+
+<h2>The hardware</h2>
+<p>A Sony <strong>IMX471</strong> (16 MP, 4656&times;3496) behind an <strong>Intel IPU7</strong>.
+The IPU7 driver in Linux is input-system only &mdash; it delivers raw Bayer and never touches
+the hardware ISP &mdash; so every bit of processing is done by libcamera's software ISP on
+the CPU or GPU. That makes the software ISP's correctness the whole story.</p>
+
+<h2>What was wrong</h2>
+
+<div class="card">
+  <h3>1 &middot; Crop rectangle returned an error <span style="color:var(--muted);font-weight:400">&mdash; kernel</span></h3>
+  <p><code>V4L2_SEL_TGT_CROP</code> ended its case with <code>break</code> and fell through to
+  <code>return -EINVAL</code>, and no crop rectangle was ever stored in the subdev state.
+  libcamera says so itself:</p>
+  <pre><code>imx471 0-001a: Unable to get rectangle 0 on pad 0/0: Invalid argument
+imx471 0-001a: The sensor kernel driver needs to be fixed
+imx471 0-001a: The analogue crop rectangle has been defaulted to the active area size</code></pre>
+  <p>The sensor actually reads out 3856&times;2176 of its 4656&times;3496 array, so every
+  geometry-dependent correction was being computed against the wrong rectangle.</p>
+</div>
+
+<div class="card">
+  <h3>2 &middot; Test pattern generator did nothing <span style="color:var(--muted);font-weight:400">&mdash; kernel</span></h3>
+  <p><code>TEST_PATTERN_MODE</code> was declared <code>CCI_REG8</code> when 0x0600 is a 16-bit
+  register, so selecting a pattern wrote the mode into the high byte and the sensor stayed on
+  the live scene. The control read back correctly the whole time, which is what made it
+  confusing. Every other 16-bit register in the driver was already correct; 0x0600 was the
+  only outlier.</p>
+</div>
+
+<div class="card">
+  <h3>3 &middot; Analogue gain capped 1.8 stops short <span style="color:var(--muted);font-weight:400">&mdash; kernel</span></h3>
+  <p>The gain law is <code>gain = 1024 / (1024 - code)</code>. The driver capped the code at
+  800, giving 4.57&times;, where the sensor reaches 16&times; at code 960. Verified on hardware:</p>
+  <table>
+    <tr><th>code</th><th>predicted</th><th>measured</th></tr>
+    <tr><td class="num">0</td><td class="num">1.000&times;</td><td class="num">1.000&times;</td></tr>
+    <tr><td class="num">512</td><td class="num">2.000&times;</td><td class="num">2.000&times;</td></tr>
+    <tr><td class="num">800</td><td class="num">4.571&times;</td><td class="num">4.571&times;</td></tr>
+    <tr><td class="num">960</td><td class="num">16.000&times;</td><td class="num win">16.071&times;</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h3>4 &middot; No lens shading correction existed <span style="color:var(--muted);font-weight:400">&mdash; libcamera</span></h3>
+  <p>libcamera's software ISP had no lens shading support for any sensor. On this camera the
+  corners are about <strong>2.7 stops</strong> down, and the falloff is channel-dependent:
+  red needs 6.35&times; gain in the corners where blue needs 5.27&times;.</p>
+</div>
+
+<div class="card">
+  <h3>5 &middot; White balance barely worked <span style="color:var(--muted);font-weight:400">&mdash; libcamera</span></h3>
+  <p>AWB statistics are summed in the sensor's native bit depth, but the black level
+  subtracted from them is held in a <code>uint8_t</code>. For a 10-bit sensor black is
+  under-subtracted fourfold, which inflates all three channels equally and drags every gain
+  towards 1.0 &mdash; so the camera hardly white-balances at all.</p>
+  <p>Measured gains were <code>1.035 / 1.070</code> where grey world requires
+  <code>1.316 / 1.806</code>. <strong>This affects every RAW10 and RAW12 sensor using the
+  software ISP</strong>, not just this one.</p>
+</div>
+
+<h2>Lens shading, isolated</h2>
+<p>The same scene seconds apart, with lens shading correction off and on. Centre-to-corner
+falloff goes from 2.78&times; to 1.09&times;.</p>
+
+<div class="pair">
+  <figure>
+    <div class="lbl">Correction off</div>
+    <img src="images/vignetting-before.jpg" alt="Heavy vignetting, dark corners">
+  </figure>
+  <figure>
+    <div class="lbl after">Correction on</div>
+    <img src="images/vignetting-after.jpg" alt="Even illumination across the frame">
+  </figure>
+</div>
+
+<h2>Measured results</h2>
+<p>Channel ratios at the output, with a USB webcam on the same machine as a reference.
+1.000 is neutral.</p>
+
+<table>
+  <tr><th>Configuration</th><th>R/G</th><th>B/G</th><th>Vignetting</th></tr>
+  <tr><td>Stock</td><td class="num">0.871</td><td class="num">0.667</td><td class="num">2.78&times;</td></tr>
+  <tr><td>+ lens shading</td><td class="num">0.974</td><td class="num">0.855</td><td class="num win">1.09&times;</td></tr>
+  <tr><td>+ AWB fix and colour matrix</td><td class="num win">1.001</td><td class="num win">0.870</td><td class="num">1.09&times;</td></tr>
+  <tr><td>USB webcam reference</td><td class="num">0.99</td><td class="num">0.97</td><td>&mdash;</td></tr>
+</table>
+
+<h2>Where the tuning data came from</h2>
+<p>The lens shading grids and colour matrices were extracted from Intel's Windows camera
+driver package, which ships per-module tuning blobs in a CPFF container. The publicly
+available ipu6-camera-bins headers describe the format only partially &mdash; the 4&times;4
+lens shading record in particular is named but not defined &mdash; so the layout was derived
+from the data and then checked.</p>
+<p>Three independent checks that the decoding is right: every one of the 36 shading grids
+minimises at exactly the geometric centre with a value of precisely 1.000; the two green
+channels agree to three decimal places, which identifies them and confirms RGGB ordering;
+and channel falloff is ordered red &gt; green &gt; blue, as physics requires. Separately,
+libcamera master already carries a <code>CameraSensorHelperImx471</code> with
+<code>gain = 1024 / (1024 - code)</code> and a black level of 64 DN, arrived at
+independently &mdash; both match.</p>
+
+<h3>Measuring the sensor itself</h3>
+<div class="pair">
+  <figure>
+    <img src="images/bayer-redcan.jpg" alt="A red object filling the frame, used to verify Bayer order">
+    <figcaption>Bayer order verified against a saturated red subject: red sits at grid (0,0)
+    at 2.17&times; green, confirming SRGGB. The sensor's own colour-bar generator later
+    confirmed it again &mdash; once patch 2 made it work.</figcaption>
+  </figure>
+  <figure>
+    <img src="images/flatfield.jpg" alt="A flat field capture showing radial falloff">
+    <figcaption>A flat field showing the radial falloff the shading correction removes.
+    Four attempts were needed: a very wide lens needs the source close enough to fill the
+    frame, which then contributes its own falloff.</figcaption>
+  </figure>
+</div>
+
+<h2>Using it</h2>
+<p>Prebuilt Fedora 44 packages are attached to the
+<a href="https://github.com/cschalle/mipi-fixes-x1-aura/releases">releases</a>. The libcamera
+package is a drop-in: same soname, so PipeWire and WirePlumber are unaffected.</p>
+<pre><code>sudo dnf install ./libcamera-0.7.1-*.lsc2.fc44.x86_64.rpm \
+                 ./libcamera-ipa-0.7.1-*.lsc2.fc44.x86_64.rpm \
+                 ./libcamera-tools-0.7.1-*.lsc2.fc44.x86_64.rpm
+systemctl --user restart wireplumber</code></pre>
+<p>The kernel patches apply to mainline and to the Fedora 7.2.8 package, whose copy of the
+driver is byte-identical. <code>sudo dnf downgrade libcamera</code> reverts.</p>
+
+<h2>Honest notes</h2>
+<ul>
+  <li><strong>Blue is still about 10% short</strong> of the USB reference (0.870 against 0.97).
+  The cause is not yet identified.</li>
+  <li><strong>The colour matrices are validated mathematically, not colorimetrically.</strong>
+  They preserve neutral exactly and behave as predicted on real captures, but no colour chart
+  was used.</li>
+  <li><strong>Tuning is from a single environment.</strong> The measurements come from one
+  room; the camera has not been exercised across varied lighting.</li>
+  <li><strong>libcamera's CPU debayer path segfaults</strong> in unmodified upstream master.
+  That is a pre-existing bug, unrelated to this work, but it means the GPU path is the only
+  one tested here.</li>
+  <li>The full investigation in <code>findings/</code> includes the measurement mistakes and
+  the conclusions they produced before being corrected. They are left in deliberately: several
+  were only caught by comparing against a second camera.</li>
+</ul>
+
+<footer>
+  <p>The IMX471 driver and its IPU7 bridge support were written by Kate Hsuan
+  &lt;hpa@redhat.com&gt;. This work sits on top of that.</p>
+  <p>Patches, tooling and the full write-up:
+  <a href="https://github.com/cschalle/mipi-fixes-x1-aura">github.com/cschalle/mipi-fixes-x1-aura</a></p>
+</footer>
+
+</div>
+</body>
+</html>

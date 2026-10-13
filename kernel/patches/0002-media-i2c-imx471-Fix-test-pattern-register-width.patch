@@ -1,0 +1,42 @@
+From e8c7bce089b518b5d9076d585ebc469e9c390ff8 Mon Sep 17 00:00:00 2001
+From: Christian Schaller <cschalle@redhat.com>
+Date: Tue, 13 Oct 2026 10:56:49 -0400
+Subject: [PATCH 2/3] media: i2c: imx471: Fix test pattern register width
+
+TEST_PATTERN_MODE at 0x0600 is a 16 bit register, but the driver
+declares it with CCI_REG8. An 8 bit write only reaches the high byte, so
+selecting a pattern writes the mode number into 0x0600 while 0x0601
+stays zero, leaving the register at mode * 256 and the sensor producing
+no pattern at all.
+
+Every other 16 bit register in this driver is already declared with
+CCI_REG16 (0x0202 exposure, 0x0204 analogue gain, 0x0340 FLL, 0x020e
+digital gain); 0x0600 is the only one that is not.
+
+The control was accepted and read back correctly while having no effect:
+with V4L2_CID_TEST_PATTERN set to 2 ("Eight Vertical Colour Bars"),
+either before streaming or while streaming, captured frames still showed
+the live scene with an unchanged horizontal profile.
+
+Fixes: be1589e567ae ("media: i2c: imx471: Add Sony IMX471 image sensor driver")
+Signed-off-by: Christian Schaller <cschalle@redhat.com>
+---
+ drivers/media/i2c/imx471.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/imx471.c b/drivers/media/i2c/imx471.c
+index 348dbd3de..2db1b05b5 100644
+--- a/drivers/media/i2c/imx471.c
++++ b/drivers/media/i2c/imx471.c
+@@ -57,7 +57,7 @@
+ #define IMX471_REG_ORIENTATION			CCI_REG8(0x0101)
+ 
+ /* Test Pattern Control */
+-#define IMX471_REG_TEST_PATTERN			CCI_REG8(0x0600)
++#define IMX471_REG_TEST_PATTERN			CCI_REG16(0x0600)
+ 
+ /* default link frequency and external clock */
+ #define IMX471_LINK_FREQ_DEFAULT		200000000LL
+-- 
+2.55.0
+

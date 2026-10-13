@@ -1,0 +1,24 @@
+#!/usr/bin/bash
+# camshot <tuning.yaml|default> <name> - capture through libcamera with a given
+# tuning file and render the ABGR8888 output to PNG.
+set -euo pipefail
+TUNE="${1:?usage: camshot <tuning.yaml|default> <name>}"
+NAME="${2:?usage: camshot <tuning.yaml|default> <name>}"
+OUT=/home/cschalle/projects/mipi-camera/captures/ccm
+mkdir -p "$OUT"; rm -f "$OUT/$NAME"*.data
+if [ "$TUNE" = default ]; then unset LIBCAMERA_SIMPLE_TUNING_FILE
+else export LIBCAMERA_SIMPLE_TUNING_FILE="$TUNE"; fi
+timeout 60 cam -c1 --capture=6 --file="$OUT/$NAME#.data" >/dev/null 2>&1
+last=$(ls -1 "$OUT/$NAME"*.data | tail -1)
+python3 -I - "$last" "$OUT/$NAME.png" <<'PY'
+import sys, numpy as np
+from PIL import Image
+W,H=1920,1088
+d=np.fromfile(sys.argv[1],dtype=np.uint8).reshape(H,W,4)
+rgb=d[:,:,[0,1,2]]
+Image.fromarray(rgb).save(sys.argv[2])
+m=[round(float(rgb[:,:,i].mean()),1) for i in range(3)]
+g=m[1] if m[1] else 1
+print(f"  means R={m[0]} G={m[1]} B={m[2]}   R/G={m[0]/g:.3f} B/G={m[2]/g:.3f}")
+PY
+echo "  -> $OUT/$NAME.png"

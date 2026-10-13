@@ -1,0 +1,55 @@
+From 5cf84f3eda244f0a30684c2b323a5489edd9cb1b Mon Sep 17 00:00:00 2001
+From: Christian Schaller <cschalle@redhat.com>
+Date: Tue, 13 Oct 2026 10:57:19 -0400
+Subject: [PATCH 3/3] media: i2c: imx471: Raise the analogue gain limit to the
+ sensor maximum
+
+The analogue gain of this sensor follows the SMIA form
+
+	gain = (m0 * code + c0) / (m1 * code + c1)
+
+with m0 = 0, c0 = 1024, m1 = -1, c1 = 1024, that is
+
+	gain = 1024 / (1024 - code)
+
+IMX471_ANA_GAIN_MAX is 800, which caps analogue gain at 1024 / 224 =
+4.57x. Code 960 gives 16x, the sensor maximum, so the driver is giving
+up 1.8 stops of sensitivity.
+
+This is not theoretical: on a Lenovo ThinkPad X1 Carbon Gen 14 the
+software ISP saturates both exposure and analogue gain and still
+underexposes an ordinary indoor scene by around 3.8 stops.
+
+Measured on that machine, comparing the median signal of the green
+channels against the formula, with the black level removed:
+
+	code	predicted	measured
+	   0	  1.000x	  1.000x
+	 512	  2.000x	  2.000x
+	 800	  4.571x	  4.571x
+	 960	 16.000x	 16.071x
+
+Raising the limit therefore buys a measured 3.48x over the previous
+ceiling, against 3.50x predicted.
+
+Signed-off-by: Christian Schaller <cschalle@redhat.com>
+---
+ drivers/media/i2c/imx471.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/imx471.c b/drivers/media/i2c/imx471.c
+index 2db1b05b5..bfffafa85 100644
+--- a/drivers/media/i2c/imx471.c
++++ b/drivers/media/i2c/imx471.c
+@@ -41,7 +41,7 @@
+ /* Analog gain control */
+ #define IMX471_REG_ANALOG_GAIN			CCI_REG16(0x0204)
+ #define IMX471_ANA_GAIN_MIN			0
+-#define IMX471_ANA_GAIN_MAX			800
++#define IMX471_ANA_GAIN_MAX			960
+ #define IMX471_ANA_GAIN_STEP			1
+ #define IMX471_ANA_GAIN_DEFAULT			0
+ 
+-- 
+2.55.0
+
