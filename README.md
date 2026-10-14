@@ -20,6 +20,14 @@ them, and the tooling used to find them.
 | 4 | libcamera, software ISP | no lens shading correction existed at all | corners ~2.7 stops down; vignetting 2.78x |
 | 5 | libcamera, software ISP | AWB statistics summed in the sensor's native bit depth while the black level subtracted from them was 8-bit | black under-subtracted 4x, pulling every white balance gain towards unity |
 
+A sixth issue is documented but **not fixed here**, and it is userspace, not
+the driver: libcamera leaves the sensor's vertical blanking at its 220-line
+minimum (52.5 fps), which pins exposure at 1290 lines / 18.8 ms. The kernel
+side is correct — vblank ranges 220..64447 and raising it properly extends
+`exposure_max` — but libcamera's simple pipeline never pulls that lever. In a
+dim room auto-exposure saturates at that ceiling *and* the full 16x gain and
+still falls ~4x short of a USB webcam. Dropping to 30 fps would buy ~0.8 stop.
+
 Fix 5 is **not IMX471 specific** — it affects every RAW10/RAW12 sensor using
 libcamera's software ISP.
 
@@ -28,12 +36,33 @@ libcamera's software ISP.
 Channel ratios at the output, against a USB webcam on the same machine as a
 reference. 1.000 is neutral.
 
+A controlled low-light pair — same seat, same lamps, laptop not moved, stock
+side recaptured on a stock kernel with stock libcamera reinstalled, both held
+400 frames so AGC and AWB fully settled. Measured on a flat painted ceiling at
+identical coordinates in both frames:
+
+| Configuration | R/G | B/G | frame brightness |
+|---------------|-----|-----|------------------|
+| stock | 0.890 | 0.672 | 31.1 |
+| all five fixes | **1.047** | 0.823 | **90.9** |
+| USB webcam reference | 1.052 | 0.989 | — |
+
+Measured AWB gains in that scene were `1.098 / 1.220` stock against
+`1.387 / 2.260` fixed — fix 5 visible directly.
+
+In brighter light, with the vignetting column from the controlled flat-field pair:
+
 | Configuration | R/G | B/G | vignetting |
 |---------------|-----|-----|-----------|
 | stock | 0.871 | 0.667 | 2.78x |
 | + lens shading | 0.974 | 0.855 | **1.09x** |
 | + AWB fix and colour matrix | **1.001** | **0.870** | 1.09x |
 | USB webcam reference | 0.99 | 0.97 | — |
+
+Blue remains ~17% short in low light. That residue is a grey-world AWB
+limitation, and the colour matrix amplifies it rather than causing it: blue
+measures 0.910 with the matrix disabled and 0.823 with it enabled, against
+0.838 predicted from the 3615K blue row.
 
 ## Layout
 

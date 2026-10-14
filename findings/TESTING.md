@@ -144,3 +144,44 @@ subdev state had persisted.
 Running libcamera once (`cam -c1 --capture=2`) configures it, after which raw
 v4l2 captures work. Kernel config was also compared: ours differs from stock in
 16 lines, all BTF/debuginfo and BUILD_SALT, nothing camera related.
+
+## Measurement trap: AGC/AWB need ~250 frames to settle in low light
+
+A 70-frame capture was used for the early before/after images. That is enough in
+a bright room and badly short in a dim one, because AGC walks exposure and gain
+in 10% steps per frame and AWB integrates alongside it. In the low-light test
+scene a 70-frame capture of the *fixed* stack caught analogue gain still at code
+66 (1.07x) on its way to 960 (16x), producing an image 2.9x darker than the same
+configuration converged, and a blue ratio of 0.534 against 0.823 converged. The
+unconverged frame read as a regression that did not exist.
+
+Stock converges faster than fixed, because its 800 cap (4.57x) is reached sooner
+— stock at 70 frames measured ceiling luma 46.2 against 50.7 converged, only 10%
+short. So the short recipe penalised the fixed side far more than the stock side,
+i.e. it understated the improvement rather than inflating it. Either way the
+comparison was not sound.
+
+Capture 400 frames and confirm convergence from the logs before measuring:
+
+    LIBCAMERA_LOG_LEVELS=IPASoftAwb:DEBUG,IPASoftExposure:DEBUG \
+      cam -c1 --capture=400 --file=out#.data
+
+AGC is settled when `exp`/`again` stop changing; AWB when `gain R/B` plateaus.
+In the low-light scene that was exp 1290 / again 960 with gains 1.387/2.260
+(fixed), against exp 1290 / again 800 with gains 1.098/1.220 (stock) — defect 5
+visible directly in the gain figures.
+
+## Measurement trap: whole-frame metrics need a fixed subject
+
+Centre-versus-corner luma is a vignetting proxy only while the subject does not
+move. A re-shoot with the subject re-centred put a dark head where the bright
+ceiling had been and read as "vignetting 0.92x" — corners brighter than centre —
+which was framing, not optics. Likewise a horizontal ceiling profile became
+meaningless once the ceiling lamp drifted into the sampled strip (3.22x at one
+sample point: that is the lamp, not shading).
+
+Measure a named flat surface at identical coordinates in both frames, and check
+the frames actually align first. Normalised cross-correlation on a *structured*
+background region is the cheap test: 0.906 on the cabinet/doorway strip confirmed
+the laptop had not moved. The same test on the featureless ceiling returned
+-0.063 and means nothing — there is no structure there to correlate.

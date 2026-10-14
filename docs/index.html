@@ -95,12 +95,19 @@
 produced at that point &mdash; including the middle one, where the fixes were half in and the
 result was briefly worse in one respect than where it started.</p>
 
+<p class="lede">The first and last images are a controlled pair: same seat, same lamps, laptop
+not moved between them, and the stock side recaptured on a stock kernel with stock libcamera
+reinstalled rather than simulated. Both were held for 400 frames so that auto-exposure and
+auto white balance had fully settled &mdash; in a room this dim they need roughly 250, and a
+shorter capture flatters whichever side is measured first.</p>
+
 <div class="trio">
   <figure>
     <div class="lbl">1 &mdash; Stock Fedora 44</div>
     <img src="images/stage1-stock.jpg" alt="Stock camera output: flat, desaturated, dark corners">
-    <figcaption>Flat and desaturated, with visibly dark corners. Captured through the
-    unmodified libcamera 0.7.1 software ISP.</figcaption>
+    <figcaption>Dark, green-cast and falling away badly at the corners. Stock kernel, stock
+    libcamera 0.7.1. Auto-exposure is pinned against both its limits here and still cannot
+    reach its own brightness target.</figcaption>
   </figure>
   <figure>
     <div class="lbl mid">2 &mdash; Lens shading in, AWB still broken</div>
@@ -112,8 +119,9 @@ result was briefly worse in one respect than where it started.</p>
   <figure>
     <div class="lbl after">3 &mdash; All five fixes</div>
     <img src="images/stage3-final.jpg" alt="Final output: neutral colour, even illumination">
-    <figcaption>Even illumination and neutral colour. Red/green measures 1.001 against a USB
-    webcam reference of 0.99.</figcaption>
+    <figcaption>Even illumination and neutral colour, at 2.9&times; the frame brightness of
+    the stock capture. Red/green measures 1.047 against a USB webcam reference of 1.052 on the
+    same scene. The visible grain is the sensor running at the full 16&times; gain.</figcaption>
   </figure>
 </div>
 
@@ -183,6 +191,16 @@ imx471 0-001a: The analogue crop rectangle has been defaulted to the active area
   software ISP</strong>, not just this one.</p>
 </div>
 
+<p>Measured on a flat painted ceiling, at identical coordinates in both frames, with a USB
+webcam on the same machine shooting the same room as the reference:</p>
+
+<table>
+  <tr><th>Low-light scene, both converged</th><th>R/G</th><th>B/G</th><th>Frame brightness</th></tr>
+  <tr><td>Stock</td><td class="num">0.890</td><td class="num">0.672</td><td class="num">31.1</td></tr>
+  <tr><td>All five fixes</td><td class="num win">1.047</td><td class="num">0.823</td><td class="num win">90.9</td></tr>
+  <tr><td>USB webcam reference</td><td class="num">1.052</td><td class="num">0.989</td><td>&mdash;</td></tr>
+</table>
+
 <h2>Lens shading, isolated</h2>
 <p>The same scene seconds apart, with lens shading correction off and on. Centre-to-corner
 falloff goes from 2.78&times; to 1.09&times;.</p>
@@ -199,8 +217,9 @@ falloff goes from 2.78&times; to 1.09&times;.</p>
 </div>
 
 <h2>Measured results</h2>
-<p>Channel ratios at the output, with a USB webcam on the same machine as a reference.
-1.000 is neutral.</p>
+<p>Channel ratios at the output in brighter light, with a USB webcam on the same machine as
+a reference. 1.000 is neutral. The vignetting column comes from the controlled flat-field pair
+above.</p>
 
 <table>
   <tr><th>Configuration</th><th>R/G</th><th>B/G</th><th>Vignetting</th></tr>
@@ -253,8 +272,22 @@ driver is byte-identical. <code>sudo dnf downgrade libcamera</code> reverts.</p>
 
 <h2>Honest notes</h2>
 <ul>
-  <li><strong>Blue is still about 10% short</strong> of the USB reference (0.870 against 0.97).
-  The cause is not yet identified.</li>
+  <li><strong>Blue is still short</strong> &mdash; about 17% in the low-light scene above
+  (0.823 against the reference's 0.989). The residue is a white balance limitation, not a
+  decoding error: libcamera's grey-world AWB assumes the scene averages to neutral, and this
+  room does not.</li>
+  <li><strong>The colour matrix makes that residue worse, and correctly so.</strong> Measured
+  on the same scene, blue sits at 0.910 with the matrix disabled and 0.823 with it enabled.
+  Feeding the measured input through the 3615K blue row predicts 0.838, which matches. A
+  saturation matrix amplifies whatever white balance error it is handed, so the remaining gain
+  is in AWB, not in the matrix.</li>
+  <li><strong>libcamera never trades frame rate for exposure.</strong> The sensor's vertical
+  blanking sits at its 220-line minimum, pinning exposure at 1290 lines &mdash; 18.8&nbsp;ms at
+  52.5&nbsp;fps. The kernel is not at fault: vblank ranges 220 to 64447 and raising it correctly
+  extends the exposure maximum, but libcamera's simple pipeline leaves it alone. In the scene
+  above, auto-exposure saturates at that ceiling <em>and</em> the full 16&times; analogue gain
+  and still lands roughly 4&times; below the USB reference, which is where the grain in the
+  final image comes from. Dropping to 30&nbsp;fps would buy about 0.8 of a stop. Not fixed here.</li>
   <li><strong>The colour matrices are validated mathematically, not colorimetrically.</strong>
   They preserve neutral exactly and behave as predicted on real captures, but no colour chart
   was used.</li>
