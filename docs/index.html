@@ -45,6 +45,14 @@
   .pair .lbl { font-size:13px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
                color:var(--muted); margin-bottom:6px; }
   .pair .lbl.after { color:var(--good); }
+  .trio { display:grid; gap:18px; grid-template-columns:1fr; margin:22px 0; }
+  @media (min-width:760px) { .trio { grid-template-columns:repeat(3,1fr); } }
+  .trio figure { margin:0; }
+  .trio .lbl { font-size:12.5px; font-weight:600; letter-spacing:.03em; text-transform:uppercase;
+               color:var(--muted); margin-bottom:6px; }
+  .trio .lbl.mid { color:var(--accent); }
+  .trio .lbl.after { color:var(--good); }
+  .trio figcaption { font-size:13px; }
   table { border-collapse:collapse; width:100%; margin:16px 0 8px; font-size:15px; display:block; overflow-x:auto; }
   th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
   th { font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); font-weight:600; }
@@ -82,20 +90,38 @@
   </p>
 </header>
 
-<h2>Before and after</h2>
-<p class="lede">The same camera in a Google Meet call, before the fixes and after. The
-yellow-green cast, the dark corners and the muddy skin tones are all gone.</p>
+<h2>The progression</h2>
+<p class="lede">Three stages of the same camera. Each image is what the pipeline actually
+produced at that point &mdash; including the middle one, where the fixes were half in and the
+result was briefly worse in one respect than where it started.</p>
 
-<div class="pair">
+<div class="trio">
   <figure>
-    <div class="lbl">Before &mdash; stock Fedora 44</div>
-    <img src="images/meet-before.jpg" alt="Video call before the fixes, with a strong yellow-green cast">
+    <div class="lbl">1 &mdash; Stock Fedora 44</div>
+    <img src="images/stage1-stock.jpg" alt="Stock camera output: flat, desaturated, dark corners">
+    <figcaption>Flat and desaturated, with visibly dark corners. Captured through the
+    unmodified libcamera 0.7.1 software ISP.</figcaption>
   </figure>
   <figure>
-    <div class="lbl after">After &mdash; all five fixes</div>
-    <img src="images/final-after.jpg" alt="Camera output after the fixes, neutral colour">
+    <div class="lbl mid">2 &mdash; Lens shading in, AWB still broken</div>
+    <img src="images/stage2-yellow.jpg" alt="A Meet call with a strong yellow-green cast">
+    <figcaption>A real Meet call. The corners are fixed and the colour matrix is applied, but
+    the white balance bug is still there &mdash; and the matrix faithfully amplifies it into a
+    strong yellow-green cast.</figcaption>
+  </figure>
+  <figure>
+    <div class="lbl after">3 &mdash; All five fixes</div>
+    <img src="images/stage3-final.jpg" alt="Final output: neutral colour, even illumination">
+    <figcaption>Even illumination and neutral colour. Red/green measures 1.001 against a USB
+    webcam reference of 0.99.</figcaption>
   </figure>
 </div>
+
+<p>Stage 2 is worth dwelling on. The colour matrix was correct the whole time &mdash; it
+preserves neutral to within 0.002% and behaved exactly as predicted on real captures. What it
+could not do was fix the white balance error being fed to it, and increasing saturation
+amplifies whatever imbalance it is given. Removing the matrix looked like the fix; finding the
+black level bug underneath it was the actual fix.</p>
 
 <h2>The hardware</h2>
 <p>A Sony <strong>IMX471</strong> (16 MP, 4656&times;3496) behind an <strong>Intel IPU7</strong>.
