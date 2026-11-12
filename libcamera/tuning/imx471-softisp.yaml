@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# Sony IMX471 as fitted to the Lenovo ThinkPad X1 Carbon Gen 14.
+#
+# Black level is the sensor pedestal of 64 DN at 10 bits, in the 16 bit
+# units the BlackLevel algorithm expects (64 << 6).
+#
+# Lsc coefficients are the plain floating point polynomial fit; libipa
+# quantises them to UQ<2,6> itself once resampled for the sensor's
+# analogue crop.
+#
+# Colour matrices are applied after white balance and each row sums to
+# one, so a neutral input stays neutral.
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Lsc:
+      # Polynomial rather than tabular: LscTable cannot resample its
+      # grids for the sensor's analogue crop, and this sensor reads
+      # out 3856x2176 of its 4656x3496 array.
+      type: polynomial
+      sets:
+        - ct: 2694
+          r:
+            cx: 0.5
+            cy: 0.5
+            k0: 6.232229
+            k1: 1.915956
+            k2: -14.198143
+            k3: 119.530090
+            k4: -142.976535
+          g:
+            cx: 0.5
+            cy: 0.5
+            k0: 7.124488
+            k1: -23.041254
+            k2: 101.929473
+            k3: -114.099067
+            k4: 19.733260
+          b:
+            cx: 0.5
+            cy: 0.5
+            k0: 8.171521
+            k1: -38.310003
+            k2: 170.954282
+            k3: -245.436970
+            k4: 102.751629
+        - ct: 2784
+          r:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.226037
+            k1: 11.073734
+            k2: -74.125876
+            k3: 252.645405
+            k4: -233.984590
+          g:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.643219
+            k1: -0.081584
+            k2: -22.176606
+            k3: 148.219928
+            k4: -162.524259
+          b:
+            cx: 0.5
+            cy: 0.5
+            k0: 6.052429
+            k1: -3.462263
+            k2: -16.376015
+            k3: 152.234446
+            k4: -173.939470
+        - ct: 3615
+          r:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.010856
+            k1: 13.168908
+            k2: -88.904793
+            k3: 282.242117
+            k4: -251.237449
+          g:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.464567
+            k1: 2.111705
+            k2: -36.259662
+            k3: 178.602227
+            k4: -181.354044
+          b:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.785844
+            k1: -0.926603
+            k2: -31.545241
+            k3: 184.581931
+            k4: -194.789394
+        - ct: 4656
+          r:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.715300
+            k1: 5.886968
+            k2: -41.597981
+            k3: 185.498864
+            k4: -191.226206
+          g:
+            cx: 0.5
+            cy: 0.5
+            k0: 6.646849
+            k1: -18.080282
+            k2: 71.620517
+            k3: -42.980872
+            k4: -32.743076
+          b:
+            cx: 0.5
+            cy: 0.5
+            k0: 7.116974
+            k1: -25.946604
+            k2: 102.546829
+            k3: -92.791874
+            k4: -6.017692
+        - ct: 5694
+          r:
+            cx: 0.5
+            cy: 0.5
+            k0: 5.576617
+            k1: 7.416494
+            k2: -51.072650
+            k3: 205.590949
+            k4: -204.634659
+          g:
+            cx: 0.5
+            cy: 0.5
+            k0: 6.473214
+            k1: -15.165278
+            k2: 53.979771
+            k3: -4.144734
+            k4: -60.254959
+          b:
+            cx: 0.5
+            cy: 0.5
+            k0: 6.748991
+            k1: -19.059683
+            k2: 65.432697
+            k3: -15.595871
+            k4: -59.388143
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 2694
+          ccm: [  1.5632, -0.3171, -0.2461,
+                 -0.4703,  1.6967, -0.2264,
+                  0.0009, -0.9716,  1.9707 ]
+        - ct: 2784
+          ccm: [  1.6169, -0.4751, -0.1418,
+                 -0.4882,  1.6958, -0.2075,
+                  0.0066, -0.7474,  1.7407 ]
+        - ct: 3615
+          ccm: [  1.6768, -0.5785, -0.0983,
+                 -0.3825,  1.5926, -0.2101,
+                 -0.0014, -0.6058,  1.6072 ]
+        - ct: 4656
+          ccm: [  1.5392, -0.3893, -0.1500,
+                 -0.2889,  1.5346, -0.2457,
+                  0.0005, -0.5633,  1.5628 ]
+        - ct: 5694
+          ccm: [  1.5414, -0.4120, -0.1293,
+                 -0.2660,  1.6099, -0.3438,
+                 -0.0014, -0.5417,  1.5431 ]
+  - Adjust:
+  - Agc:
+...

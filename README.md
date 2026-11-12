@@ -67,8 +67,8 @@ measures 0.910 with the matrix disabled and 0.823 with it enabled, against
 ## Layout
 
     kernel/patches/      three patches against mainline, ready for linux-media
-    libcamera/patches/   lens shading + AWB fix, backported to libcamera 0.7.1
-    libcamera/tuning/    imx471.yaml: black level, lens shading, colour matrices
+    libcamera/patches/   lens shading + AWB fix, backported to 0.7.1; LSC alone rebased onto 0.7.2
+    libcamera/tuning/    imx471.yaml for this backport; imx471-softisp.yaml for upstream's own Lsc algorithm
     tools/               the analysis scripts used throughout
     findings/            the full investigation, including the wrong turns
     docs/                project page (GitHub Pages)
@@ -95,6 +95,16 @@ The kernel patches are tested on hardware and ready to send to linux-media. The
 libcamera work is tested as a Fedora package; the lens shading feature and the
 AWB fix are both candidates for upstream, and the AWB fix is worth sending on its
 own since it is not specific to this sensor.
+
+**Checked against current libcamera master (2026-11-12):** the AWB statistics
+fix already has an independently-authored equivalent upstream (merged before
+0.7.2), so it does not need porting further. Master also merged its own lens
+shading algorithm for the software ISP on 2026-10-22, using the same shared
+approach as the patch here — but it's GPU-path only and its fixed-point format
+clips at 3.98x gain, short of the 6.35x this sensor's corners need, so it
+visibly helps but does not fully correct this camera yet. The patches and
+tuning data in this repo remain what's needed for a correct image. Details and
+the verification in `findings/LIBCAMERA.md`.
 
 ## Credit
 

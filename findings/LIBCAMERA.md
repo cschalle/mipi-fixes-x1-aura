@@ -491,3 +491,89 @@ remaining candidate is the statistics being gathered over a different population
 than the output frame - the stats sample every other 2x2 block within a window,
 while the measurement covers the full frame. Confirming that needs the raw frame
 and the gains from the *same* run, which is the next thing to measure.
+
+## Resolved: the gap was an 8-bit/native-depth mismatch in the statistics sums
+
+This was root-caused and fixed in the 0.7.1 backport (`lc071/`, commit
+"software_isp: Normalise statistics sums to 8 bits"), closing the question left
+open above. `SWSTATS_FINISH_LINE_STATS()` accumulated the per-channel sums at
+the sensor's native bit depth, while the black level the IPA subtracts from
+them is expressed in 8-bit units. For a 10-bit sensor that under-subtracts
+black by 4x, which pulls every AWB gain towards unity - exactly the "gains are
+right but the output isn't neutral" symptom, since the gains computed *are*
+right for the (wrongly scaled) statistics fed in. Measured on the IMX471: gains
+went from 1.035/1.070 to 1.283/1.760, and output R/G from 0.871 to 1.001 against
+a 0.99 USB-webcam reference.
+
+**This fix is specific to 0.7.1 and must not be carried forward past it.**
+Javier Tia independently found and fixed the identical root cause upstream
+("libcamera: software_isp: Normalize statistics sums to 8-bit", reviewed by
+Milan Zamazal, Barnabás Pőcze and Hans de Goede), and that fix is already in
+0.7.2. The two fixes don't touch the same function - ours is in
+`SWSTATS_FINISH_LINE_STATS` per accumulation macro, upstream's is a
+`sumShift_` right-shift in `finishFrame()` - so a cherry-pick of ours onto
+0.7.2 applies and builds with no conflict, but **doubles the correction**
+(sum / 16 instead of / 4 for a 10-bit sensor), which would have shipped a
+real AWB regression. `libcamera-lsc-0.7.2.patch` carries the LSC commit only;
+see README.md's version-status section.
+
+## Versions
+
+Both the LSC algorithm and this stats fix exist as a self-contained backport
+against libcamera 0.7.1 (`lc071/`). Only the LSC half is rebased onto 0.7.2
+(`libcamera-lsc-0.7.2.patch`), which is what Fedora 45 currently ships - the
+stats fix is obsolete there, per the note above. The
+master-targeted rewrite described earlier in this document (using libipa's
+shared `LscAlgorithm`) sits uncommitted in `libcamera/` and has not been
+updated for the ~50 commits master has gained since it was written - treat the
+measurements and code excerpts above as a record of that point in time, not of
+current master.
+
+## Superseded: master already has its own Lsc algorithm, with a real gap for this camera
+
+As of 2026-10-22, master carries its own LSC implementation for softisp
+(`src/ipa/softisp/algorithms/lsc.cpp`, by Xander Pronk, Rick ten Wolde and
+Milan Zamazal, reviewed by Kieran Bingham) - the same libipa `LscAlgorithm`
+approach as the work above, independently arrived at and already merged. It is
+wired into the EGL/GPU debayer path (not CPU, which has its own pre-existing
+segfault noted above) via `context.lscEnabled` and `DebayerParams::lscLut`.
+Carrying the custom C++ port forward would just duplicate already-reviewed
+mainline code for no benefit, so it was not rebased. The uncommitted working
+tree was snapshotted to a local branch (`softisp-lsc-upstream`, on top of
+`a92285e`) in case it's ever wanted, and left alone otherwise.
+
+What's still genuinely ours: the decoded IMX471 lens-shading data and the
+polynomial fit, which upstream has no equivalent of for this sensor.
+`tools/gen-tuning-softisp.py` adapts `gen-tuning.py` to upstream's schema -
+algorithm key `Lsc` (not `LensShadingCorrection`), and 3 components (`r`,
+`g`, `b`) rather than the 4 Bayer channels, since that's what the merged
+algorithm's descriptor asks for (the two green grids are averaged before
+fitting). Output: `libcamera-work/imx471-softisp.yaml`.
+
+**Verified against the actual merged code**, not just schema-read: a one-off
+test (`libcamera-work/validation/lsc_imx471_tuning.cpp`, built against a
+`test/ipa/libipa/` unit test temporarily, not kept in the libcamera tree)
+links `ipa::LscAlgorithm<UQ<2,6>>` directly, feeds it the generated YAML and
+this sensor's real analogue crop (424,624)/3856x2176, and checks the
+resampled grid. It parses and resamples without error, and corner gain
+exceeds centre gain as expected (vignetting falls off outward).
+
+**But it clips.** `UQ<2,6>` is 2 integer + 6 fractional bits, unsigned - its
+representable range tops out at 3.984375x gain. This sensor's corners need up
+to 6.35x (R) within the actual analogue crop, per the measurement earlier in
+this document. The test shows R and B corner gain both landing on exactly
+3.98438, the format's saturation point, not the ~6x and ~5.3x the polynomial
+fit actually predicts there - `FixedPointQTraits::fromFloat()` clamps
+silently via `std::clamp`, so this doesn't crash or warn, it just
+under-corrects. Centre values (1.0) are unaffected since they're nowhere near
+the ceiling.
+
+So upstream's merged algorithm is necessary but not sufficient for this
+camera: it will visibly improve corner vignetting but not fully correct it,
+because the format it was sized for doesn't have headroom for gains this
+sensor+lens combination needs. The custom EGL shader implementation earlier
+in this document worked around exactly this by uploading gains as
+`(gain - 1) / scale` with `scale` a runtime uniform rather than a fixed
+format - worth raising upstream (a wider format such as `UQ<3,5>`, max
+7.96875x, would cover this sensor with room to spare) rather than
+resurrecting the custom path.

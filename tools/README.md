@@ -13,6 +13,7 @@ this sensor produces; `raw.py` holds the geometry in one place.
     aiqb.py          parse Intel .aiqb files (CPFF container, CMC records)
     lsc.py           decode the lens shading grids from an .aiqb
     gen-tuning.py    build a libcamera tuning file from an .aiqb
+    gen-tuning-softisp.py  the same, in upstream's own Lsc schema (merged 2026-10-22)
 
 A capture is meaningless without the controls that produced it, so `capraw`
 always writes a `.meta` file beside the data.
